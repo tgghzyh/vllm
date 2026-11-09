@@ -1,18 +1,18 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-use vllm_tokenizer::{DecodedText, DynTokenizer};
+use vllm_tokenizer::{DecodedText, DynTokenizer, Tokenizer};
 use winnow::ascii::{multispace0 as ws0, multispace1 as ws1};
-use winnow::combinator::{alt, delimited, seq};
+use winnow::combinator::{alt, delimited, opt, peek, seq};
 use winnow::error::{ContextError, ErrMode};
 use winnow::prelude::*;
-use winnow::stream::{Compare, FindSlice, Partial, Stream, StreamIsPartial};
+use winnow::stream::Stream;
 use winnow::token::{literal, rest, take_until};
 
 use super::parameters::{ParamElement, ParamInput, ToolSchemas};
 use super::utils::{
-    MarkerScanState, MarkerStream, Scan, incomplete, parse_buffered_event, safe_text_len,
-    scan_markers, take_until_marker,
+    Attributed, AttributedExt, Marker, MarkerScanState, MarkerStream, Scan, SpecialToken,
+    incomplete, parse_buffered_event_attributed, safe_text_len, scan_markers, take_until_marker,
 };
 use super::{JsonStyle, OpenToolCall, Result, ToolParser, ToolParserError, ToolParserOutput};
 use crate::tool::Tool;
@@ -27,7 +27,67 @@ const ELEMENT_START: &str = "]<]minimax[>[<";
 const ELEMENT_END_START: &str = "]<]minimax[>[</";
 const MIXED_TEXT_FIELD: &str = "$text";
 
-type MinimaxM3Input<'i> = Partial<&'i str>;
+type MinimaxM3Input<'i> = Attributed<'i, MinimaxM3Markers>;
+
+/// MiniMax M3 markers resolved against the tokenizer.
+///
+/// Every structural tag begins with the namespace marker, an added token, so
+/// each marker is guarded on it: a tag counts only where the dedicated token
+/// produced its namespace marker, and an ordinary-token spelling stays text. A
+/// tokenizer without the token leaves the markers matched by spelling.
+#[derive(Debug)]
+struct MinimaxM3Markers {
+    /// The namespace token, if the tokenizer has it.
+    namespace_token: Option<SpecialToken>,
+    namespace: Marker,
+    tool_call_start: Marker,
+    tool_call_end: Marker,
+    invoke_start: Marker,
+    invoke_end: Marker,
+    element_start: Marker,
+    element_end_start: Marker,
+}
+
+impl MinimaxM3Markers {
+    /// Resolve the markers against the namespace token of `tokenizer`.
+    fn new(tokenizer: &dyn Tokenizer) -> Self {
+        let namespace_token = tokenizer.token_to_id(NAMESPACE).map(|id| SpecialToken {
+            text: NAMESPACE.to_string(),
+            id,
+        });
+        let marker = |spelling: &str| tag_marker(namespace_token.as_ref(), spelling);
+        Self {
+            namespace: marker(NAMESPACE),
+            tool_call_start: marker(TOOL_CALL_START),
+            tool_call_end: marker(TOOL_CALL_END),
+            invoke_start: marker(INVOKE_START),
+            invoke_end: marker(INVOKE_END),
+            element_start: marker(ELEMENT_START),
+            element_end_start: marker(ELEMENT_END_START),
+            namespace_token,
+        }
+    }
+
+    /// The close tag of element `name`.
+    fn close_tag(&self, name: &str) -> Marker {
+        tag_marker(
+            self.namespace_token.as_ref(),
+            &format!("{ELEMENT_END_START}{name}>"),
+        )
+    }
+}
+
+/// The marker `spelling`, which begins with the namespace marker, guarded on
+/// `namespace` when the tokenizer has it.
+fn tag_marker(namespace: Option<&SpecialToken>, spelling: &str) -> Marker {
+    let rest = spelling
+        .strip_prefix(NAMESPACE)
+        .expect("every MiniMax M3 tag begins with the namespace marker");
+    match namespace {
+        Some(namespace) => Marker::special(namespace).then_text(rest),
+        None => Marker::text(spelling),
+    }
+}
 
 #[derive(Debug)]
 enum MinimaxM3Mode {
@@ -62,7 +122,7 @@ enum InvokeBody {
         invoke_end_scan: MarkerScanState,
     },
     /// Inside a top-level parameter whose text streams as it arrives.
-    Parameter { close_tag: String },
+    Parameter { close_tag: Marker },
     /// Inside a parameter that is converted through the tool's schema once its
     /// element closes.
     BufferedParameter {
@@ -152,21 +212,27 @@ struct ElementBodyScanState {
 /// tag. A top-level parameter whose schema is exactly `string` streams as its
 /// text arrives; any other parameter, nested elements included, is converted
 /// through the schema once its element closes.
+///
+/// A tag counts only where the namespace token produced its namespace marker,
+/// so the format spelled with ordinary tokens (the model quoting it) stays
+/// text.
 pub struct MinimaxM3ToolParser {
-    buffer: String,
+    buffer: DecodedText,
     mode: MinimaxM3Mode,
     emitted_tool_count: usize,
     tool_parameters: ToolSchemas,
+    markers: MinimaxM3Markers,
 }
 
 impl MinimaxM3ToolParser {
     /// Create a MiniMax M3 tool parser.
-    pub fn new(tools: &[Tool]) -> Self {
+    pub fn new(tools: &[Tool], tokenizer: &dyn Tokenizer) -> Self {
         Self {
-            buffer: String::new(),
+            buffer: DecodedText::default(),
             mode: MinimaxM3Mode::Text,
             emitted_tool_count: 0,
             tool_parameters: ToolSchemas::from_tools(tools),
+            markers: MinimaxM3Markers::new(tokenizer),
         }
     }
 
@@ -174,7 +240,7 @@ impl MinimaxM3ToolParser {
     fn apply_event(&mut self, event: MinimaxM3Event, output: &mut ToolParserOutput) -> Result<()> {
         match event {
             MinimaxM3Event::Text { len: consumed_len } => {
-                output.push_text(&self.buffer[..consumed_len]);
+                output.push_text(&self.buffer.text[..consumed_len]);
             }
             MinimaxM3Event::ToolBlockStart => self.mode = MinimaxM3Mode::ToolBlock,
             MinimaxM3Event::InvokeStart { name } => {
@@ -193,7 +259,7 @@ impl MinimaxM3ToolParser {
                 *body = if self.tool_parameters.is_verbatim_string(&call.name, &name) {
                     call.arguments.open_string(&name);
                     InvokeBody::Parameter {
-                        close_tag: format!("{ELEMENT_END_START}{name}>"),
+                        close_tag: self.markers.close_tag(&name),
                     }
                 } else {
                     InvokeBody::BufferedParameter {
@@ -204,7 +270,7 @@ impl MinimaxM3ToolParser {
             }
             MinimaxM3Event::ValueText { len } => {
                 let (call, _) = self.mode.invoke_mut()?;
-                call.arguments.push(&self.buffer[..len]);
+                call.arguments.push(&self.buffer.text[..len]);
             }
             MinimaxM3Event::ParameterEnd => {
                 let (call, body) = self.mode.invoke_mut()?;
@@ -250,21 +316,23 @@ impl MinimaxM3ToolParser {
 }
 
 impl ToolParser for MinimaxM3ToolParser {
-    fn create(tools: &[Tool], _tokenizer: DynTokenizer) -> Result<Box<dyn ToolParser>>
+    fn create(tools: &[Tool], tokenizer: DynTokenizer) -> Result<Box<dyn ToolParser>>
     where
         Self: Sized + 'static,
     {
-        Ok(Box::new(Self::new(tools)))
+        Ok(Box::new(Self::new(tools, tokenizer.as_ref())))
     }
 
     fn parse_into(&mut self, chunk: DecodedText, output: &mut ToolParserOutput) -> Result<()> {
-        self.buffer.push_str(&chunk.text);
+        self.buffer.append(chunk);
 
-        while let Some((event, consumed_len)) = parse_buffered_event(&self.buffer, |input| {
-            parse_next_minimax_m3_event(input, &mut self.mode)
-        })? {
+        while let Some((event, consumed_len)) =
+            parse_buffered_event_attributed(&self.buffer, &self.markers, |input| {
+                parse_next_minimax_m3_event(input, &mut self.mode)
+            })?
+        {
             self.apply_event(event, output)?;
-            self.buffer.drain(..consumed_len);
+            let _ = self.buffer.drain_prefix(consumed_len);
         }
 
         Ok(())
@@ -274,10 +342,10 @@ impl ToolParser for MinimaxM3ToolParser {
         let mut output = ToolParserOutput::default();
         match self.mode {
             MinimaxM3Mode::Text => {
-                output.push_text(&self.buffer);
+                output.push_text(&self.buffer.text);
             }
             MinimaxM3Mode::ToolBlock => {
-                if !self.buffer.trim_start().is_empty() {
+                if !self.buffer.text.trim_start().is_empty() {
                     return Err(ToolParserError::IncompleteToolCall {
                         parser: "MiniMax M3",
                     });
@@ -297,7 +365,7 @@ impl ToolParser for MinimaxM3ToolParser {
     fn reset(&mut self) -> String {
         self.mode = MinimaxM3Mode::Text;
         self.emitted_tool_count = 0;
-        std::mem::take(&mut self.buffer)
+        std::mem::take(&mut self.buffer).text
     }
 }
 
@@ -329,12 +397,15 @@ fn parse_text_event(input: &mut MinimaxM3Input<'_>) -> ModalResult<MinimaxM3Even
 
 /// Parse a MiniMax M3 tool-block start marker.
 fn tool_block_start_event(input: &mut MinimaxM3Input<'_>) -> ModalResult<MinimaxM3Event> {
-    literal(TOOL_CALL_START).value(MinimaxM3Event::ToolBlockStart).parse_next(input)
+    (&input.markers().tool_call_start)
+        .value(MinimaxM3Event::ToolBlockStart)
+        .parse_next(input)
 }
 
 /// Parse a safe text run before the next MiniMax M3 marker.
 fn safe_text_event(input: &mut MinimaxM3Input<'_>) -> ModalResult<MinimaxM3Event> {
-    safe_text_len(input, TOOL_CALL_START).map(|len| MinimaxM3Event::Text { len })
+    let markers = input.markers();
+    safe_text_len(input, &markers.tool_call_start).map(|len| MinimaxM3Event::Text { len })
 }
 
 /// Parse one event inside a MiniMax M3 tool block.
@@ -344,16 +415,18 @@ fn parse_tool_block_event(input: &mut MinimaxM3Input<'_>) -> ModalResult<Minimax
 
 /// Parse a MiniMax M3 tool-block end marker.
 fn tool_block_end_event(input: &mut MinimaxM3Input<'_>) -> ModalResult<MinimaxM3Event> {
-    (ws0, literal(TOOL_CALL_END))
+    let markers = input.markers();
+    (ws0, &markers.tool_call_end)
         .value(MinimaxM3Event::ToolBlockEnd)
         .parse_next(input)
 }
 
 /// Parse a MiniMax M3 invoke start tag.
 fn invoke_start_event(input: &mut MinimaxM3Input<'_>) -> ModalResult<MinimaxM3Event> {
+    let markers = input.markers();
     let (name,) = seq!(
         _: ws0,
-        _: literal(INVOKE_START),
+        _: &markers.invoke_start,
         _: (ws1, literal("name=")),
         partial_attr_value,
         _: literal(">"),
@@ -371,8 +444,9 @@ fn parse_invoke_event(
     invoke_end_scan: &mut MarkerScanState,
 ) -> ModalResult<MinimaxM3Event> {
     ws0.void().parse_next(input)?;
+    let markers = input.markers();
     alt((
-        literal(INVOKE_END).value(MinimaxM3Event::InvokeEnd),
+        (&markers.invoke_end).value(MinimaxM3Event::InvokeEnd),
         open_element_tag.map(|name: &str| MinimaxM3Event::ParameterStart {
             name: name.to_string(),
         }),
@@ -389,12 +463,13 @@ fn skipped_invoke_rest_event(
     input: &mut MinimaxM3Input<'_>,
     invoke_end_scan: &mut MarkerScanState,
 ) -> ModalResult<MinimaxM3Event> {
-    if input.starts_with(NAMESPACE) {
+    let markers = input.markers();
+    if opt(peek(&markers.namespace)).parse_next(input)?.is_some() {
         return malformed();
     }
     seq!(
-        _: take_until_marker(INVOKE_END, invoke_end_scan),
-        _: literal(INVOKE_END),
+        _: take_until_marker(&markers.invoke_end, invoke_end_scan),
+        _: &markers.invoke_end,
     )
     .value(MinimaxM3Event::InvokeEnd)
     .parse_next(input)
@@ -405,12 +480,13 @@ fn skipped_invoke_rest_event(
 /// A child element makes the value malformed, since its text already streamed.
 fn parse_parameter_value_event(
     input: &mut MinimaxM3Input<'_>,
-    close_tag: &str,
+    close_tag: &Marker,
 ) -> ModalResult<MinimaxM3Event> {
     alt((
-        literal(close_tag).value(MinimaxM3Event::ParameterEnd),
+        close_tag.value(MinimaxM3Event::ParameterEnd),
         |input: &mut MinimaxM3Input<'_>| {
-            safe_text_len(input, NAMESPACE).map(|len| MinimaxM3Event::ValueText { len })
+            let markers = input.markers();
+            safe_text_len(input, &markers.namespace).map(|len| MinimaxM3Event::ValueText { len })
         },
     ))
     .parse_next(input)
@@ -422,15 +498,19 @@ fn buffered_value_event<'i>(
     name: &str,
     body_scan: &mut ElementBodyScanState,
 ) -> ModalResult<MinimaxM3Event> {
-    let close_tag = format!("{ELEMENT_END_START}{name}>");
-    let mut element = (
+    let close_tag = input.markers().close_tag(name);
+    // Wait for the whole element, then parse its body once.
+    let element = input.checkpoint();
+    (
         |input: &mut MinimaxM3Input<'i>| take_element_body(input, body_scan),
-        literal(close_tag.as_str()),
+        &close_tag,
     )
-        .take()
+        .void()
         .parse_next(input)?;
+    input.reset(&element);
     let _guard = ParserRecursionGuard::enter()?;
-    let value = element_body(&mut element, name)?;
+    let value = element_body(input, name)?;
+    (&close_tag).void().parse_next(input)?;
 
     Ok(MinimaxM3Event::BufferedValue { value })
 }
@@ -439,14 +519,16 @@ fn buffered_value_event<'i>(
 /// nested child tags, and leave the close tag for the caller.
 ///
 /// Like [`take_until_marker`], it consumes nothing until that close tag has
-/// arrived, and keeps its progress in `state` across chunks.
+/// arrived, and keeps its progress in `state` across chunks. Only genuine
+/// namespace markers count as tags.
 fn take_element_body<'i>(
     input: &mut MinimaxM3Input<'i>,
     state: &mut ElementBodyScanState,
 ) -> ModalResult<&'i str> {
+    let markers = input.markers();
     // An element start is a prefix of an element end, so the end goes first:
     // index 0 is a close tag.
-    let tags = [ELEMENT_END_START, ELEMENT_START];
+    let tags = [&markers.element_end_start, &markers.element_start];
     let start = input.offset();
     loop {
         let (at, index) = match scan_markers(input, &tags, start + state.scan_start)? {
@@ -465,12 +547,12 @@ fn take_element_body<'i>(
             (0, _) => state.depth -= 1,
             _ => state.depth += 1,
         }
-        state.scan_start = at - start + tags[index].len();
+        state.scan_start = at - start + tags[index].as_str().len();
     }
 }
 
 /// Parse a MiniMax M3 parameter element.
-fn parameter_element(input: &mut &str) -> ModalResult<ParamElement> {
+fn parameter_element(input: &mut MinimaxM3Input<'_>) -> ModalResult<ParamElement> {
     let name = open_element_tag(input)?.to_string();
     let _guard = ParserRecursionGuard::enter()?;
     let value = element_body(input, &name)?;
@@ -479,18 +561,15 @@ fn parameter_element(input: &mut &str) -> ModalResult<ParamElement> {
 }
 
 /// Parse a MiniMax M3 opening element tag.
-fn open_element_tag<'i, I>(input: &mut I) -> ModalResult<&'i str>
-where
-    I: Stream<Slice = &'i str> + StreamIsPartial + Compare<&'static str> + FindSlice<&'static str>,
-{
-    let name = seq!(
-        _: literal(ELEMENT_START),
+fn open_element_tag<'i>(input: &mut MinimaxM3Input<'i>) -> ModalResult<&'i str> {
+    let markers = input.markers();
+    let (name,) = seq!(
+        _: &markers.element_start,
         take_until(1.., ">"),
         _: literal(">"),
     )
     .parse_next(input)?;
 
-    let name = name.0;
     if name.starts_with('/') || name.trim().is_empty() {
         return malformed();
     }
@@ -499,34 +578,31 @@ where
 }
 
 /// Parse a MiniMax M3 closing element tag.
-fn close_element_tag(input: &mut &str, name: &str) -> ModalResult<()> {
-    literal(ELEMENT_END_START).void().parse_next(input)?;
-    literal(name).void().parse_next(input)?;
-    literal(">").void().parse_next(input)
+fn close_element_tag(input: &mut MinimaxM3Input<'_>, name: &str) -> ModalResult<()> {
+    (&input.markers().close_tag(name)).void().parse_next(input)
 }
 
 /// Parse the body of one MiniMax M3 element.
-fn element_body(input: &mut &str, closing_name: &str) -> ModalResult<ParamInput> {
-    let close_tag = format!("{ELEMENT_END_START}{closing_name}>");
+fn element_body(input: &mut MinimaxM3Input<'_>, closing_name: &str) -> ModalResult<ParamInput> {
+    let markers = input.markers();
+    let close_tag = markers.close_tag(closing_name);
     let mut text = String::new();
     let mut elements = Vec::new();
 
     loop {
         text.push_str(text_until_namespace(input)?);
 
-        if input.starts_with(&close_tag) {
+        if opt(peek(&close_tag)).parse_next(input)?.is_some() {
             // Close tag reached, end of element body.
             break;
         }
-        if input.starts_with(ELEMENT_START) {
+        if opt(peek(&markers.element_start)).parse_next(input)?.is_some() {
             // Child element start reached, parse child element recursively.
             elements.push(parameter_element(input)?);
             continue;
         }
-        if input.starts_with(NAMESPACE) {
-            // Unexpected namespace marker.
-            return malformed();
-        }
+        // Unexpected namespace marker.
+        return malformed();
     }
 
     if elements.is_empty() {
@@ -540,8 +616,9 @@ fn element_body(input: &mut &str, closing_name: &str) -> ModalResult<ParamInput>
 }
 
 /// Parse text until the next MiniMax M3 namespace marker.
-fn text_until_namespace<'i>(input: &mut &'i str) -> ModalResult<&'i str> {
-    take_until(0.., NAMESPACE).parse_next(input)
+fn text_until_namespace<'i>(input: &mut MinimaxM3Input<'i>) -> ModalResult<&'i str> {
+    let markers = input.markers();
+    take_until_marker(&markers.namespace, &mut MarkerScanState::default()).parse_next(input)
 }
 
 /// Preserve mixed text content under a reserved object field.
@@ -584,13 +661,66 @@ mod tests {
     use serde_json::{Value, json};
     use thiserror_ext::AsReport;
 
+    use vllm_tokenizer::Tokenizer as _;
+    use vllm_tokenizer::test_utils::TestTokenizer;
+
     use super::{
-        ELEMENT_END_START, ELEMENT_START, INVOKE_END, INVOKE_START, MinimaxM3ToolParser,
+        ELEMENT_END_START, ELEMENT_START, INVOKE_END, INVOKE_START, MinimaxM3ToolParser, NAMESPACE,
         TOOL_CALL_END, TOOL_CALL_START, ToolParser,
     };
-    use crate::tool::test_utils::{collect_stream, split_by_chars, test_tools};
-    use crate::tool::{Tool, ToolParserEvent, ToolParserOutput, ToolParserTestExt as _};
+    use crate::tool::test_utils::{
+        collect_attributed_stream, decode_ids, split_by_chars, test_tools,
+    };
+    use crate::tool::{Result, Tool, ToolParserEvent, ToolParserOutput};
     use crate::utils::recursion::MAX_PARSER_RECURSION_DEPTH;
+
+    /// The MiniMax M3 tokenizer has the namespace marker as an added token.
+    fn tokenizer() -> TestTokenizer {
+        TestTokenizer::new().with_regular_token(NAMESPACE, 256)
+    }
+
+    /// Encode with the added token, so namespace markers are structural.
+    fn dedicated(text: &str) -> Vec<u32> {
+        tokenizer().encode(text, false).unwrap()
+    }
+
+    /// Encode as ordinary bytes only, so namespace marker spellings are text.
+    fn ordinary(text: &str) -> Vec<u32> {
+        tokenizer().encode_ordinary(text).unwrap()
+    }
+
+    /// Run token IDs through the real incremental decoder.
+    fn decode(ids: &[u32]) -> vllm_tokenizer::DecodedText {
+        decode_ids(&tokenizer(), ids)
+    }
+
+    /// Stream the structural encoding of the concatenated `chunks`, split at
+    /// the chunk boundaries, and coalesce the tool-call deltas.
+    fn collect_stream<T: ToolParser + ?Sized>(parser: &mut T, chunks: &[&str]) -> ToolParserOutput {
+        collect_attributed_stream(parser, &tokenizer(), chunks)
+    }
+
+    fn parser() -> MinimaxM3ToolParser {
+        MinimaxM3ToolParser::new(&m3_test_tools(), &tokenizer())
+    }
+
+    /// `ToolParserTestExt` over structurally encoded input.
+    #[easy_ext::ext(M3ParserTestExt)]
+    impl<T: ToolParser + ?Sized> T {
+        /// Feed one structurally encoded text delta.
+        fn parse_chunk(&mut self, chunk: &str) -> Result<ToolParserOutput> {
+            let mut output = ToolParserOutput::default();
+            self.parse_into(decode(&dedicated(chunk)), &mut output)?;
+            Ok(output)
+        }
+
+        /// Parse complete structurally encoded output.
+        fn parse_complete(&mut self, text: &str) -> Result<ToolParserOutput> {
+            let mut output = self.parse_chunk(text)?;
+            output.append(self.finish()?);
+            Ok(output.coalesce())
+        }
+    }
 
     fn element(name: &str, body: &str) -> String {
         format!("{ELEMENT_START}{name}>{body}{ELEMENT_END_START}{name}>")
@@ -718,8 +848,7 @@ mod tests {
     #[test]
     fn minimax_m3_recursion_limit_accepts_boundary_and_rejects_next_depth() {
         let parse = |depth| {
-            MinimaxM3ToolParser::new(&m3_test_tools())
-                .parse_complete(&build_tool_block(&[("convert", nested_element(depth))]))
+            parser().parse_complete(&build_tool_block(&[("convert", nested_element(depth))]))
         };
         assert!(parse(MAX_PARSER_RECURSION_DEPTH).is_ok());
         assert!(parse(MAX_PARSER_RECURSION_DEPTH + 1).is_err());
@@ -727,7 +856,7 @@ mod tests {
 
     #[test]
     fn minimax_m3_parse_complete_without_tool_call_keeps_text() {
-        let mut parser = MinimaxM3ToolParser::new(&m3_test_tools());
+        let mut parser = parser();
         let output = parser.parse_complete("Hello, world!").unwrap();
 
         assert_eq!(output.normal_text(), "Hello, world!");
@@ -736,7 +865,7 @@ mod tests {
 
     #[test]
     fn minimax_m3_parse_complete_extracts_single_tool_call() {
-        let mut parser = MinimaxM3ToolParser::new(&m3_test_tools());
+        let mut parser = parser();
         let output = parser
             .parse_complete(&build_tool_block(&[(
                 "get_weather",
@@ -755,7 +884,7 @@ mod tests {
 
     #[test]
     fn minimax_m3_parse_complete_preserves_prefix_and_ignores_trailing_text() {
-        let mut parser = MinimaxM3ToolParser::new(&m3_test_tools());
+        let mut parser = parser();
         let output = format!(
             "Let me check. {} This trailing text is ignored.",
             build_tool_block(&[("get_weather", element("city", "Seattle"))])
@@ -768,7 +897,7 @@ mod tests {
 
     #[test]
     fn minimax_m3_parse_complete_extracts_multiple_invokes() {
-        let mut parser = MinimaxM3ToolParser::new(&m3_test_tools());
+        let mut parser = parser();
         let output = parser
             .parse_complete(&build_tool_block(&[
                 ("get_weather", element("city", "Seattle")),
@@ -791,7 +920,7 @@ mod tests {
 
     #[test]
     fn minimax_m3_invoke_body_junk_drops_rest_of_invoke() {
-        let mut parser = MinimaxM3ToolParser::new(&m3_test_tools());
+        let mut parser = parser();
         let output = parser
             .parse_complete(&build_tool_block(&[(
                 "get_weather",
@@ -812,7 +941,7 @@ mod tests {
 
     #[test]
     fn minimax_m3_parse_complete_converts_schema_types() {
-        let mut parser = MinimaxM3ToolParser::new(&m3_test_tools());
+        let mut parser = parser();
         let output = parser
             .parse_complete(&build_tool_block(&[(
                 "convert",
@@ -841,7 +970,7 @@ mod tests {
 
     #[test]
     fn minimax_m3_parse_complete_converts_nested_arguments() {
-        let mut parser = MinimaxM3ToolParser::new(&m3_test_tools());
+        let mut parser = parser();
         let output = parser
             .parse_complete(&build_tool_block(&[("create_order", order_arguments())]))
             .unwrap();
@@ -883,7 +1012,7 @@ mod tests {
 
     #[test]
     fn minimax_m3_parse_complete_handles_multiline_leaf_parameters() {
-        let mut parser = MinimaxM3ToolParser::new(&m3_test_tools());
+        let mut parser = parser();
         let output = parser
             .parse_complete(&build_tool_block(&[(
                 "calculate_area",
@@ -908,7 +1037,7 @@ mod tests {
 
     #[test]
     fn minimax_m3_streaming_extracts_single_tool_call() {
-        let mut parser = MinimaxM3ToolParser::new(&m3_test_tools());
+        let mut parser = parser();
         let output = collect_stream(
             &mut parser,
             &[
@@ -929,7 +1058,7 @@ mod tests {
 
     #[test]
     fn minimax_m3_streaming_preserves_prefix_text() {
-        let mut parser = MinimaxM3ToolParser::new(&m3_test_tools());
+        let mut parser = parser();
         let output = collect_stream(
             &mut parser,
             &[
@@ -946,7 +1075,7 @@ mod tests {
 
     #[test]
     fn minimax_m3_streaming_preserves_ordered_events() {
-        let mut parser = MinimaxM3ToolParser::new(&m3_test_tools());
+        let mut parser = parser();
         let output = collect_stream(
             &mut parser,
             &[
@@ -974,7 +1103,7 @@ mod tests {
 
     #[test]
     fn minimax_m3_streaming_without_tool_call_emits_text_incrementally() {
-        let mut parser = MinimaxM3ToolParser::new(&m3_test_tools());
+        let mut parser = parser();
         let output = collect_stream(&mut parser, &["Hello, ", "world!"]);
 
         assert_eq!(output.normal_text(), "Hello, world!");
@@ -985,7 +1114,7 @@ mod tests {
     fn minimax_m3_streaming_handles_marker_split_across_chunks() {
         let text = build_tool_block(&[("get_weather", element("city", "Seattle"))]);
         let chunks = split_by_chars(&text, 3);
-        let mut parser = MinimaxM3ToolParser::new(&m3_test_tools());
+        let mut parser = parser();
         let output = collect_stream(&mut parser, &chunks);
 
         assert_eq!(output.calls().len(), 1);
@@ -999,7 +1128,7 @@ mod tests {
             ("get_weather", element("city", "NYC")),
         ]);
         let chunks = split_by_chars(&text, 7);
-        let mut parser = MinimaxM3ToolParser::new(&m3_test_tools());
+        let mut parser = parser();
         let output = collect_stream(&mut parser, &chunks);
 
         assert_eq!(output.calls().len(), 2);
@@ -1009,7 +1138,7 @@ mod tests {
 
     #[test]
     fn minimax_m3_streams_string_parameters_before_the_invoke_closes() {
-        let mut parser = MinimaxM3ToolParser::new(&m3_test_tools());
+        let mut parser = parser();
         let mut output = ToolParserOutput::default();
 
         // The call and its arguments so far, after each chunk.
@@ -1041,7 +1170,7 @@ mod tests {
     #[test]
     fn minimax_m3_child_element_in_string_parameter_is_malformed() {
         // The string value streams as it arrives, so it cannot become an object.
-        let mut parser = MinimaxM3ToolParser::new(&m3_test_tools());
+        let mut parser = parser();
         let body = element("note", &format!("text {}", element("child", "value")));
 
         assert!(parser.parse_complete(&build_tool_block(&[("create_order", body)])).is_err());
@@ -1050,9 +1179,9 @@ mod tests {
     #[test]
     fn minimax_m3_streaming_matches_parse_complete_at_every_chunk_size() {
         let text = build_tool_block(&[("create_order", order_arguments())]);
-        let complete = MinimaxM3ToolParser::new(&m3_test_tools()).parse_complete(&text).unwrap();
+        let complete = parser().parse_complete(&text).unwrap();
         for size in 1..=8 {
-            let mut parser = MinimaxM3ToolParser::new(&m3_test_tools());
+            let mut parser = parser();
             let streamed = collect_stream(&mut parser, &split_by_chars(&text, size));
             assert_eq!(streamed, complete, "chunk size {size}");
         }
@@ -1065,7 +1194,7 @@ mod tests {
             build_tool_block(&[("get_weather", element("city", "Seattle"))])
         );
         let chunks = split_by_chars(&text, 5);
-        let mut parser = MinimaxM3ToolParser::new(&m3_test_tools());
+        let mut parser = parser();
         let output = collect_stream(&mut parser, &chunks);
 
         assert!(output.normal_text().is_empty());
@@ -1074,7 +1203,7 @@ mod tests {
 
     #[test]
     fn minimax_m3_finish_fails_incomplete_tool_call() {
-        let mut parser = MinimaxM3ToolParser::new(&m3_test_tools());
+        let mut parser = parser();
         parser
             .parse_chunk(&format!(
                 "{TOOL_CALL_START}{INVOKE_START} name=\"get_weather\">"
@@ -1086,7 +1215,7 @@ mod tests {
 
     #[test]
     fn minimax_m3_finish_recovers_after_bare_tool_block_start() {
-        let mut parser = MinimaxM3ToolParser::new(&m3_test_tools());
+        let mut parser = parser();
         parser.parse_chunk(TOOL_CALL_START).unwrap();
 
         let output = parser.finish().unwrap();
@@ -1096,7 +1225,7 @@ mod tests {
 
     #[test]
     fn minimax_m3_finish_recovers_completed_invoke_with_whitespace_tail() {
-        let mut parser = MinimaxM3ToolParser::new(&m3_test_tools());
+        let mut parser = parser();
         let output = parser
             .parse_complete(&format!(
                 "{}\n{}\n  \n",
@@ -1114,22 +1243,21 @@ mod tests {
 
     #[test]
     fn minimax_m3_finish_fails_partial_outer_end_marker() {
-        let mut parser = MinimaxM3ToolParser::new(&m3_test_tools());
-        parser
-            .parse_chunk(&format!(
-                "{}\n{}\n{}",
-                TOOL_CALL_START,
-                invoke("get_weather", &element("city", "Seattle")),
-                &TOOL_CALL_END[..3]
-            ))
-            .unwrap();
+        let text = format!(
+            "{TOOL_CALL_START}\n{}\n{TOOL_CALL_END}",
+            invoke("get_weather", &element("city", "Seattle")),
+        );
+        // Stop three bytes into the namespace token of the end marker.
+        let partial = decode(&dedicated(&text)).drain_prefix(text.len() - TOOL_CALL_END.len() + 3);
+        let mut parser = parser();
+        parser.parse_into(partial, &mut ToolParserOutput::default()).unwrap();
 
         assert!(parser.finish().is_err());
     }
 
     #[test]
     fn minimax_m3_malformed_tool_call_fails_fast() {
-        let mut parser = MinimaxM3ToolParser::new(&m3_test_tools());
+        let mut parser = parser();
         let error = parser
             .parse_chunk(&format!(
                 "{TOOL_CALL_START}{ELEMENT_START}bad>{TOOL_CALL_END}"
@@ -1144,7 +1272,7 @@ mod tests {
 
     #[test]
     fn minimax_m3_mixed_content_is_preserved_as_text_field() {
-        let mut parser = MinimaxM3ToolParser::new(&m3_test_tools());
+        let mut parser = parser();
         let body = element(
             "payload",
             &format!("text before {} text after", element("child", "value")),
@@ -1164,7 +1292,7 @@ mod tests {
 
     #[test]
     fn minimax_m3_mixed_text_field_avoids_child_name_collision() {
-        let mut parser = MinimaxM3ToolParser::new(&m3_test_tools());
+        let mut parser = parser();
         let body = element(
             "payload",
             &format!(
@@ -1184,6 +1312,122 @@ mod tests {
                     "child": "value"
                 }
             })
+        );
+    }
+
+    /// Feed `ids` decoded once and split at the byte offsets `splits`, then
+    /// finish and coalesce.
+    fn stream_ids(ids: &[u32], splits: &[usize]) -> ToolParserOutput {
+        let mut parser = parser();
+        let mut rest = decode(ids);
+        let mut output = ToolParserOutput::default();
+        let mut consumed = 0;
+        for &split in splits {
+            parser.parse_into(rest.drain_prefix(split - consumed), &mut output).unwrap();
+            consumed = split;
+        }
+        parser.parse_into(rest, &mut output).unwrap();
+        output.append(parser.finish().unwrap());
+        output.coalesce()
+    }
+
+    /// Stream `ids` split at every char boundary and return the arguments of
+    /// each run's single call.
+    fn arguments_at_every_split(ids: &[u32]) -> Vec<Value> {
+        let text = decode(ids).text;
+        text.char_indices()
+            .map(|(at, _)| {
+                let output = stream_ids(ids, &[at]);
+                assert_eq!(output.calls().len(), 1, "split {at}");
+                serde_json::from_str(&output.calls()[0].arguments).unwrap()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn minimax_m3_ordinary_marker_spelling_inside_string_parameter_stays_value() {
+        let quoted = format!("{ELEMENT_END_START}note>{ELEMENT_START}x>");
+        let ids = [
+            dedicated(&format!(
+                "{TOOL_CALL_START}\n{INVOKE_START} name=\"create_order\">{ELEMENT_START}note>a"
+            )),
+            ordinary(&quoted),
+            dedicated(&format!(
+                "b{ELEMENT_END_START}note>{INVOKE_END}\n{TOOL_CALL_END}"
+            )),
+        ]
+        .concat();
+
+        for arguments in arguments_at_every_split(&ids) {
+            assert_eq!(arguments, json!({ "note": format!("a{quoted}b") }));
+        }
+    }
+
+    #[test]
+    fn minimax_m3_ordinary_marker_spelling_inside_buffered_parameter_stays_value() {
+        let quoted = format!("{ELEMENT_END_START}shipping>{ELEMENT_START}x>");
+        let ids = [
+            dedicated(&format!(
+                "{TOOL_CALL_START}\n{INVOKE_START} name=\"create_order\">{ELEMENT_START}shipping>{ELEMENT_START}city>a"
+            )),
+            ordinary(&quoted),
+            dedicated(&format!(
+                "b{ELEMENT_END_START}city>{ELEMENT_END_START}shipping>{INVOKE_END}\n{TOOL_CALL_END}"
+            )),
+        ]
+        .concat();
+
+        for arguments in arguments_at_every_split(&ids) {
+            assert_eq!(
+                arguments,
+                json!({ "shipping": { "city": format!("a{quoted}b") } })
+            );
+        }
+    }
+
+    #[test]
+    fn minimax_m3_ordinary_partial_marker_streams_immediately() {
+        let mut parser = parser();
+        let mut output = ToolParserOutput::default();
+        let ids = [
+            dedicated(&format!(
+                "{TOOL_CALL_START}\n{INVOKE_START} name=\"create_order\">{ELEMENT_START}note>"
+            )),
+            ordinary("half ]<]mini"),
+        ]
+        .concat();
+        parser.parse_into(decode(&ids), &mut output).unwrap();
+
+        // Not held back: ordinary text cannot grow into the namespace token.
+        let output = output.coalesce();
+        assert_eq!(output.calls()[0].arguments, r#"{"note": "half ]<]mini"#);
+    }
+
+    #[test]
+    fn minimax_m3_ordinary_tool_call_markup_stays_text() {
+        let call = build_tool_block(&[("get_weather", element("city", "Seattle"))]);
+        let ids = [dedicated("Write "), ordinary(&call), dedicated(" here.")].concat();
+
+        let output = stream_ids(&ids, &[]);
+        assert_eq!(output.normal_text(), format!("Write {call} here."));
+        assert!(output.calls().is_empty());
+    }
+
+    #[test]
+    fn minimax_m3_without_namespace_token_matches_markers_by_spelling() {
+        let tokenizer = TestTokenizer::new();
+        let mut parser = MinimaxM3ToolParser::new(&m3_test_tools(), &tokenizer);
+        let call = build_tool_block(&[("get_weather", element("city", "Seattle"))]);
+        let ids = tokenizer.encode_ordinary(&call).unwrap();
+
+        let mut output = ToolParserOutput::default();
+        parser.parse_into(decode_ids(&tokenizer, &ids), &mut output).unwrap();
+        output.append(parser.finish().unwrap());
+        let output = output.coalesce();
+        assert_eq!(output.calls().len(), 1);
+        assert_eq!(
+            serde_json::from_str::<Value>(&output.calls()[0].arguments).unwrap(),
+            json!({ "city": "Seattle" })
         );
     }
 }
