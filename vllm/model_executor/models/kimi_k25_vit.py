@@ -244,26 +244,14 @@ class Rope2DPosEmbRepeated(nn.Module):
         )
 
     def _precompute_freqs_cis(self, device: torch.device) -> torch.Tensor:
-        """Calculate the cis(freqs) for each position in the 2D grid."""
-        N = self.max_height * self.max_width
-        flat_pos = torch.arange(0, N).float().to(device)
-        x_pos = flat_pos % self.max_width
-        y_pos = flat_pos // self.max_width
-        dim_range = (
-            torch.arange(0, self.dim, 4)[: (self.dim // 4)].float().to(device)
-        )  # C/4
-        freqs = 1.0 / (self.theta_base ** (dim_range / self.dim))
-        x_freqs = torch.outer(x_pos, freqs).float()  # N, C/4
-        y_freqs = torch.outer(y_pos, freqs).float()  # N, C/4
-        x_cis = torch.polar(torch.ones_like(x_freqs), x_freqs)  # N, C/4
-        y_cis = torch.polar(torch.ones_like(y_freqs), y_freqs)  # N, C/4
-        # N, C/4, 2
-        freqs_cis = torch.cat(
-            [x_cis.unsqueeze(dim=-1), y_cis.unsqueeze(dim=-1)], dim=-1
+        """Cache one frequency vector per coordinate, shared by both axes."""
+        positions = torch.arange(
+            max(self.max_height, self.max_width), device=device, dtype=torch.float32
         )
-        # max_height, max_width, C/2
-        freqs_cis = freqs_cis.reshape(self.max_height, self.max_width, -1)
-        return freqs_cis
+        dim_range = torch.arange(0, self.dim, 4, device=device, dtype=torch.float32)
+        freqs = 1.0 / (self.theta_base ** (dim_range / self.dim))
+        angles = torch.outer(positions, freqs)
+        return torch.polar(torch.ones_like(angles), angles)
 
     def get_freqs_cis(
         self, grid_thws: torch.Tensor | list[list[int]], device: torch.device
@@ -288,13 +276,15 @@ class Rope2DPosEmbRepeated(nn.Module):
             self.max_height,
             self.max_width,
         )
-        freqs_cis = torch.cat(
-            [
-                self.freqs_cis[:h, :w].reshape(-1, self.dim // 2).repeat(t, 1)
-                for t, h, w in shapes
-            ],
-            dim=0,
-        )
+        total = sum(t * h * w for t, h, w in shapes)
+        freqs_cis = self.freqs_cis.new_empty((total, self.dim // 2))
+        offset = 0
+        for t, h, w in shapes:
+            count = t * h * w
+            grid = freqs_cis[offset : offset + count].view(t, h, w, self.dim // 4, 2)
+            grid[..., 0] = self.freqs_cis[:w]
+            grid[..., 1] = self.freqs_cis[:h, None, :]
+            offset += count
         return freqs_cis
 
 
