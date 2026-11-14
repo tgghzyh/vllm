@@ -42,6 +42,8 @@ from vllm.model_executor.models.vision import (
     get_load_balance_assignment,
     is_vit_use_data_parallel,
 )
+from vllm.platforms import current_platform
+from vllm.triton_utils import HAS_TRITON, tl, triton
 from vllm.utils.torch_utils import async_tensor_h2d
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
@@ -68,6 +70,30 @@ def apply_rotary(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch
     dtype = x.dtype
     x1, x2 = x.float().chunk(2, dim=-1)
     return torch.cat([x1 * cos - x2 * sin, x2 * cos + x1 * sin], dim=-1).to(dtype)
+
+
+@triton.jit
+def _rotate_packed_qk(
+    qkv,
+    cos,
+    sin,
+    num_heads: tl.constexpr,
+    head_dim: tl.constexpr,
+    block_size: tl.constexpr,
+):
+    token = tl.program_id(0)
+    offsets = tl.program_id(1) * block_size + tl.arange(0, block_size)
+    half = head_dim // 2
+    head = offsets // half
+    dim = offsets % half
+    ptr = qkv + token * 3 * num_heads * head_dim + head * head_dim + dim
+    mask = head < 2 * num_heads
+    a = tl.load(ptr, mask, 0).to(tl.float32)
+    b = tl.load(ptr + half, mask, 0).to(tl.float32)
+    c = tl.load(cos + token * half + dim)
+    s = tl.load(sin + token * half + dim)
+    tl.store(ptr, a * c - b * s, mask)
+    tl.store(ptr + half, b * c + a * s, mask)
 
 
 class DeepseekV4RMSNorm(nn.Module):
@@ -147,8 +173,30 @@ class DeepseekV4VisionAttention(nn.Module):
         n = x.size(0)
         qkv, _ = self.wqkv(x)
         q, k, v = (t.view(n, self.n_heads, self.head_dim) for t in qkv.chunk(3, -1))
-        q = apply_rotary(q, cos, sin).unsqueeze(0)  # (b=1, n, h, d)
-        k = apply_rotary(k, cos, sin).unsqueeze(0)
+        if (
+            HAS_TRITON
+            and current_platform.is_cuda()
+            and n > 0
+            and qkv.is_contiguous()
+            and cos.is_contiguous()
+            and sin.is_contiguous()
+        ):
+            block_size = 256
+            grid = (n, triton.cdiv(self.n_heads * self.head_dim, block_size))
+            # Match the separate FP32 products in apply_rotary before rounding.
+            _rotate_packed_qk[grid](
+                qkv,
+                cos,
+                sin,
+                self.n_heads,
+                self.head_dim,
+                block_size,
+                enable_fp_fusion=False,
+            )
+        else:
+            q = apply_rotary(q, cos, sin)
+            k = apply_rotary(k, cos, sin)
+        q, k = q.unsqueeze(0), k.unsqueeze(0)
         # Dense (cu_seqlens=None): one image per call. Varlen (cu_seqlens
         # set): packed multi-image batch for encoder CUDA graph replay.
         o = self.attn(
