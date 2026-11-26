@@ -45,7 +45,7 @@ from vllm.v1.core.encoder_cache_manager import (
 )
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
-from vllm.v1.core.kv_cache_utils import KVCacheBlock
+from vllm.v1.core.kv_cache_utils import BlockHash, KVCacheBlock
 from vllm.v1.core.sched.interface import PauseState, SchedulerInterface
 from vllm.v1.core.sched.output import (
     CachedRequestData,
@@ -2947,8 +2947,29 @@ class Scheduler(SchedulerInterface):
 
         # Deepest cached prefix first, arrival order breaking ties.
         get_num_cached = self.kv_cache_manager.get_num_cached_tokens
-        cached = {i: get_num_cached(head[i]) for i in slots}
-        order = sorted(slots, key=lambda i: (-cached[i], i))
+        prefix_scores: dict[tuple[BlockHash, int], tuple[list[BlockHash], int]] = {}
+
+        def score(i: int) -> int:
+            request = head[i]
+            length = request.num_tokens - 1
+            num_hashes = length // self.hash_block_size
+            if request.prefix_cache_hit_limit is not None or not 0 < num_hashes <= len(
+                request.block_hashes
+            ):
+                return get_num_cached(request)
+            # Screen by the last probeable hash before comparing the prefix.
+            hashes = request.block_hashes
+            key = (hashes[num_hashes - 1], length)
+            previous = prefix_scores.get(key)
+            if previous is not None and previous[0][:num_hashes] == hashes[:num_hashes]:
+                return previous[1]
+            cached = get_num_cached(request)
+            # A cold lookup can stop at its first block.
+            if cached:
+                prefix_scores[key] = hashes, cached
+            return cached
+
+        order = sorted(slots, key=score, reverse=True)
         if order == slots:
             return
 

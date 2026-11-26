@@ -259,7 +259,7 @@ class SchedulerConfig:
     Reordering is confined to the window and to requests that are merely
     waiting, so a request that is blocked or already partially computed keeps
     its position and nothing is moved past it. Requires prefix caching and the
-    "fcfs" policy; it is ignored otherwise. Costs one prefix-cache lookup per
+    "fcfs" policy; it is ignored otherwise. Costs up to one prefix-cache lookup per
     request in the window per step, so prefer the smallest window that spans
     the usual queue depth."""
 

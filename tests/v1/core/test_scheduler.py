@@ -1593,6 +1593,39 @@ def test_cache_aware_admission_prefers_cached_prefix():
     assert [r.req_id for r in output.scheduled_new_reqs] == ["warm", "cold"]
 
 
+@pytest.mark.parametrize("num_tokens", [48, 49])
+def test_cache_aware_admission_shares_only_identical_probes(num_tokens: int):
+    scheduler, warm, cold = _setup_cache_aware(
+        num_tokens=num_tokens, cache_aware_admission_window=8
+    )
+    # The last token is recomputed, whether it ends a block or starts one.
+    duplicate = Request(
+        request_id="duplicate",
+        prompt_token_ids=[0] * (num_tokens - 1) + [7],
+        sampling_params=warm.sampling_params,
+        pooling_params=None,
+        block_hasher=get_request_block_hasher(16, sha256),
+    )
+    # An equal terminal hash cannot hide a different earlier hash.
+    different = create_requests(2, num_tokens, req_ids=["unused", "different"])[1]
+    last = (num_tokens - 1) // 16 - 1
+    different.block_hashes[last] = warm.block_hashes[last]
+    cold_again = create_requests(2, num_tokens, req_ids=["unused", "cold_again"])[1]
+    limited = create_requests(1, num_tokens, prompt_logprobs=0, req_ids=["limited"])[0]
+    for request in (cold, cold_again, warm, duplicate, different, limited):
+        scheduler.add_request(request)
+
+    manager = scheduler.kv_cache_manager
+    with patch.object(
+        manager, "get_num_cached_tokens", wraps=manager.get_num_cached_tokens
+    ) as probe:
+        scheduler._reorder_waiting_by_cached_prefix()
+    probed = [call.args[0] for call in probe.call_args_list]
+    assert probed == [cold, cold_again, warm, different, limited]
+    expected = [warm, duplicate, cold, cold_again, different, limited]
+    assert list(scheduler.waiting) == expected
+
+
 @pytest.mark.parametrize("window", [0, 4])
 def test_cache_aware_admission_protects_resident_prefix_from_eviction(window: int):
     """The point of the reordering, not just its ordering.
